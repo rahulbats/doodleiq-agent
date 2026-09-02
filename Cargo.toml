@@ -1,0 +1,51 @@
+[package]
+name = "doodleiq"
+version = "0.1.1"
+description = "DoodleIQ local inference provider gateway"
+authors = ["DoodleIQ"]
+license = "MIT"
+repository = "https://github.com/rahulbats/doodleiq-agent"
+homepage = "https://doodleiq.com"
+edition = "2021"
+rust-version = "1.77.2"
+
+# Standalone crate — no repo-root workspace.
+[workspace]
+
+# Releases are cut locally: packaging/release-local.sh builds macOS (universal)
+# and Linux (in Docker), signs + notarizes macOS, and uploads to Cloudflare R2.
+# No CI service. See DISTRIBUTION.md.
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+dotenvy = "0.15"
+env_logger = "0.11"
+futures-util = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+debug-assertions = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# TLS is rustls + platform verifier (no OpenSSL), so release binaries are
+# self-contained on every target. Linux hosts still need a system CA bundle
+# (`ca-certificates` — present on every non-`scratch` base image and distro).

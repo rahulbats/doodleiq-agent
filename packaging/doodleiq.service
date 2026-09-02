@@ -1,0 +1,40 @@
+# systemd unit for the DoodleIQ provider agent (Linux).
+#
+#   sudo cp doodleiq.service /etc/systemd/system/
+#   sudo cp doodleiq /usr/local/bin/                # the binary
+#   sudo loginctl enable-linger $USER               # if running as --user, optional
+#   # edit User= below, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now doodleiq
+#
+# Run `doodleiq configure` and `doodleiq pair` once as the same user BEFORE
+# enabling the service (they write ~/.config/doodleiq/).
+
+[Unit]
+Description=DoodleIQ inference provider agent
+Documentation=https://doodleiq.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+# Point at the same account whose ~/.config/doodleiq/ holds the pairing.
+Environment=HOME=/home/CHANGE_ME
+ExecStart=/usr/local/bin/doodleiq run
+Restart=on-failure
+RestartSec=5
+# The agent exits non-zero if the gateway or heartbeat loop dies; let systemd
+# bring it back rather than leaving a phantom-online provider.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Hardening (loosen if your model runtime needs more access).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/CHANGE_ME/.config/doodleiq
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

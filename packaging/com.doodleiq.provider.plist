@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the DoodleIQ provider (macOS).
+
+    cp doodleiq /usr/local/bin/
+    mkdir -p ~/Library/LaunchAgents
+    cp com.doodleiq.provider.plist ~/Library/LaunchAgents/
+    # edit the two CHANGE_ME paths below (your home dir), then:
+    launchctl load -w ~/Library/LaunchAgents/com.doodleiq.provider.plist
+
+  Run `doodleiq configure` and `doodleiq pair` once first. Stop with:
+    launchctl unload -w ~/Library/LaunchAgents/com.doodleiq.provider.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.doodleiq.provider</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/doodleiq</string>
+        <string>run</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/CHANGE_ME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/doodleiq.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/doodleiq.err.log</string>
+</dict>
+</plist>
