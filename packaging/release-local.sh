@@ -14,8 +14,9 @@
 #   APPLE_CODESIGN_IDENTITY   "Developer ID Application: NAME (TEAMID)"            (optional; unsigned if unset)
 #   NOTARY_PROFILE           keychain profile from `xcrun notarytool store-credentials`  (optional)
 #   LINUX_TARGETS            default "x86_64-unknown-linux-gnu"; space-separated; "none" to skip
-#   REPO                     default "rahulbats/doodleiq-agent" (only used in the GitHub fallback URL)
+#   REPO                     default "rahulbats/doodleiq-agent" (GitHub fallback URL + release target)
 #   SKIP_UPLOAD=1            build + package only, leave archives in apps/provider/dist/
+#   SKIP_GITHUB_RELEASE=1    don't mirror archives to a GitHub release (needs `gh` auth'd otherwise)
 #
 # Upload uses whichever is set up:
 #   wrangler  — `wrangler login` (or CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID); no S3 keys
@@ -168,6 +169,24 @@ done
 put "$dist/root/install.sh"  "install.sh"  "text/x-shellscript" "public,max-age=300"
 put "$dist/root/install.ps1" "install.ps1" "text/plain"         "public,max-age=300"
 
-say "published $VERSION"
+say "published $VERSION to R2"
 echo "   $RELEASE_BASE_URL/install.sh"
 echo "   $RELEASE_BASE_URL/latest/   (and $RELEASE_BASE_URL/$VERSION/)"
+
+# ----------------------------------------------- mirror to GitHub Releases
+# R2 is the primary download; the GitHub release is the fallback install.sh
+# points at and what people expect to find on an open-source repo. Opt out
+# with SKIP_GITHUB_RELEASE=1.
+if [ "${SKIP_GITHUB_RELEASE:-}" != "1" ] && command -v gh >/dev/null 2>&1; then
+  say "GitHub release $VERSION"
+  if gh release view "$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+    gh release upload "$VERSION" --repo "$REPO" --clobber "$dist"/archives/*
+  else
+    gh release create "$VERSION" --repo "$REPO" \
+      --title "$VERSION" --generate-notes "$dist"/archives/*
+  fi
+  echo "   https://github.com/$REPO/releases/tag/$VERSION"
+else
+  warn "skipping GitHub release (SKIP_GITHUB_RELEASE=1 or gh not installed)"
+  warn "to publish manually: gh release create $VERSION --repo $REPO --generate-notes $dist/archives/*"
+fi

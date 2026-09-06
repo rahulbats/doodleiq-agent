@@ -237,29 +237,14 @@ fn machine_model() -> String {
 
 fn machine_location() -> String {
     if let Ok(tz) = std::env::var("TZ") {
-        if !tz.trim().is_empty() {
-            return tz;
+        let tz = tz.trim();
+        if !tz.is_empty() {
+            return tz.to_string();
         }
     }
-    #[cfg(unix)]
-    if let Ok(path) = fs::read_link("/etc/localtime") {
-        if let Some(zone) = path.to_string_lossy().split("/zoneinfo/").nth(1) {
-            return zone.to_string();
-        }
-    }
-    #[cfg(windows)]
-    if let Some(value) = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-TimeZone).Id",
-        ],
-    ) {
-        return value;
-    }
-    "Location unavailable".to_string()
+    // Reads the OS timezone directly on every platform (`/etc/localtime` on
+    // Linux, `CFTimeZone` on macOS, the registry on Windows) — no subprocess.
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "Location unavailable".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,10 +398,19 @@ struct GatewayState {
     upstream: reqwest::Client,
     /// Rolling heartbeat delivery health, shared with the `/health` handler.
     heartbeat_health: Arc<HeartbeatHealth>,
+    /// Ed25519 device key, loaded once at startup. Every usage receipt is
+    /// signed with it, so it must not be re-read from disk per request.
+    signing_key: Arc<SigningKey>,
 }
 
 #[derive(Clone, Default)]
 struct CloudflaredState {
+    /// A blocking `std::sync::Mutex` on purpose. It guards a plain process
+    /// handle, not an async IO resource, and is only touched from synchronous
+    /// functions (`launch_cloudflared`, `stop_cloudflared`, `cloudflared_running`)
+    /// for non-blocking calls — `try_wait`, `kill`, an assignment. The guard is
+    /// never held across an `.await`. Per Tokio's own guidance, a blocking mutex
+    /// is the right primitive here; `tokio::sync::Mutex` would only add overhead.
     process: Arc<Mutex<Option<Child>>>,
 }
 
@@ -581,51 +575,28 @@ fn cloudflared_running(state: &CloudflaredState) -> bool {
         .unwrap_or(false)
 }
 
-/// Kill stale managed `cloudflared` connectors left behind by previous runs or
-/// by agents that crashed without cleaning up their child. Every connector we
-/// launch uses `--no-autoupdate`, which the system/token-file service and any
-/// unrelated user tunnels do not, so this targets only our managed instance. This
-/// prevents many connectors for the same tunnel from competing on the public
-/// hostname (which surfaces as intermittent network errors for consumers).
+/// Kill the `cloudflared` connector a previous run of this agent launched but
+/// did not clean up (e.g. after a crash). Uses the recorded PID file, so it
+/// touches only our own orphan — never a user's other tunnels or a
+/// system-installed `cloudflared` service. Leaving an orphan running would let
+/// two connectors compete for the same public hostname, which surfaces as
+/// intermittent network errors for consumers.
 fn kill_stale_managed_cloudflared() {
-    // macOS ships a BSD `pkill` that rejects `--`-style GNU long options, so
-    // `pkill -f --no-autoupdate` emits an "illegal option" usage error and is a
-    // no-op. List full command lines with `ps` and kill only our managed
-    // connector (a `cloudflared tunnel run` that passed `--no-autoupdate`),
-    // which is portable across BSD and GNU platforms and avoids noise on stderr.
-    #[cfg(unix)]
-    {
-        let stdout = Command::new("ps")
-            .args(["-axo", "pid=,command="])
-            .output()
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).to_string());
-        let Some(stdout) = stdout else { return };
-        for line in stdout.lines() {
-            let is_managed = line.contains("cloudflared")
-                && line.contains("tunnel")
-                && line.contains("run")
-                && line.contains("--no-autoupdate");
-            if !is_managed {
-                continue;
-            }
-            if let Some(pid) = line.split_whitespace().next() {
-                let _ = Command::new("kill").arg(pid).status();
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Stop only our managed connector: a cloudflared.exe whose command line
-        // carries `--no-autoupdate` (the token-file service and user tunnels do not).
-        let script = "Get-CimInstance Win32_Process -Filter \"Name='cloudflared.exe'\" | \
-             Where-Object { $_.CommandLine -match 'tunnel' -and $_.CommandLine -match 'run' \
-             -and $_.CommandLine -match '--no-autoupdate' } | \
-             ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let Some(path) = cloudflared_pid_path() else { return };
+    let Ok(contents) = fs::read_to_string(&path) else { return };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        let _ = fs::remove_file(&path);
+        return;
+    };
+    if pid_is_cloudflared(pid) {
+        #[cfg(unix)]
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
             .output();
     }
+    let _ = fs::remove_file(&path);
 }
 
 fn launch_cloudflared(tunnel_token: &str, state: &CloudflaredState) -> Result<(), String> {
@@ -658,6 +629,7 @@ fn launch_cloudflared(tunnel_token: &str, state: &CloudflaredState) -> Result<()
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("Unable to start cloudflared: {err}"))?;
+    record_cloudflared_pid(child.id());
     *process = Some(child);
     drop(process);
     std::thread::sleep(std::time::Duration::from_millis(750));
@@ -678,6 +650,7 @@ fn stop_cloudflared(state: &CloudflaredState) -> Result<(), String> {
             .map_err(|err| format!("Unable to stop cloudflared: {err}"))?;
         let _ = child.wait();
     }
+    clear_cloudflared_pid();
     Ok(())
 }
 
@@ -706,6 +679,48 @@ fn config_path() -> Result<PathBuf, String> {
 
 fn device_key_path() -> Result<PathBuf, String> {
     Ok(config_path()?.with_file_name("device.key"))
+}
+
+/// Records the PID of the `cloudflared` connector this agent launched, so a
+/// later run (including one after a crash) can clean up the exact orphan
+/// rather than pattern-matching the process table.
+fn cloudflared_pid_path() -> Option<PathBuf> {
+    Some(config_path().ok()?.with_file_name("cloudflared.pid"))
+}
+
+/// True if a process with this PID is currently a running `cloudflared`.
+/// Guards against PID reuse before we send a kill.
+fn pid_is_cloudflared(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("cloudflared"))
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("cloudflared.exe"))
+            .unwrap_or(false)
+    }
+}
+
+fn record_cloudflared_pid(pid: u32) {
+    if let Some(path) = cloudflared_pid_path() {
+        let _ = fs::write(path, pid.to_string());
+    }
+}
+
+fn clear_cloudflared_pid() {
+    if let Some(path) = cloudflared_pid_path() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn log_file_path() -> Result<PathBuf, String> {
@@ -1484,6 +1499,12 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
     );
 
     let (parts, body) = request.into_parts();
+    // The body is buffered (not streamed) on purpose: a streaming chat
+    // completion needs `stream_options.include_usage` injected so we can meter
+    // token usage, and that means parsing the JSON. The proxy serves one
+    // consumer per provider at a time, so buffering a bounded payload is not a
+    // throughput concern. Non-chat paths could be streamed straight through,
+    // but that split isn't worth the extra code path at this concurrency.
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BYTES).await {
         Ok(body) => request_body_with_usage(body, parts.uri.path()),
         Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large"),
@@ -1689,7 +1710,7 @@ async fn submit_usage_receipt(
         "status": status,
     }))
     .map_err(|err| format!("unable to serialize usage receipt: {err}"))?;
-    let signature = device_signing_key()?.sign(&body);
+    let signature = state.signing_key.sign(&body);
     let response = state
         .client
         .post(format!("{}/v1/usage-receipts", control_plane_url()))
@@ -1819,6 +1840,14 @@ fn token_usage(payload: &Value) -> Option<TokenUsage> {
 }
 
 fn usage_from_sse_buffer(buffer: &[u8]) -> Option<TokenUsage> {
+    // This runs on every streamed chunk until usage is found, but OpenAI only
+    // emits the `usage` block in the final event (with `stream_options`). Gate
+    // the UTF-8 + per-line JSON parsing on a cheap byte scan so every earlier
+    // chunk — the overwhelming majority — costs one memcmp sweep and no
+    // allocation.
+    if !buffer.windows(7).any(|w| w == b"\"usage\"") {
+        return None;
+    }
     let text = std::str::from_utf8(buffer).ok()?;
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data:") else {
@@ -1981,6 +2010,7 @@ fn gateway_state(config: RuntimeConfig) -> Result<GatewayState, String> {
         client: provider_http_client()?,
         upstream,
         heartbeat_health: Arc::new(HeartbeatHealth::default()),
+        signing_key: Arc::new(device_signing_key()?),
     })
 }
 
@@ -2223,6 +2253,13 @@ mod tests {
     fn reads_stream_usage() {
         let event = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}\n\n";
         assert_eq!(usage_from_sse_buffer(event).unwrap().total_tokens, 13);
+    }
+
+    #[test]
+    fn sse_buffer_without_usage_returns_none() {
+        // Every delta chunk before the final event — the byte gate must skip it.
+        let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+        assert!(usage_from_sse_buffer(event).is_none());
     }
 
     #[test]
