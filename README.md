@@ -19,6 +19,23 @@ This ~6 MB Rust binary runs on the provider's machine. It:
 Pairing generates an Ed25519 keypair locally; the private key never leaves the
 machine.
 
+## What's open, what's hosted
+
+This agent is open so you can **verify exactly what runs on your machine and what
+it sends us** — every network call it makes is specified in
+[`PROTOCOL.md`](PROTOCOL.md). It is not a partial release: this is the whole
+agent.
+
+The **marketplace control plane** — accounts, payments and payouts, discovery,
+reputation — is a hosted service and is not open source. The agent talks to it
+over six documented HTTPS endpoints; nothing about your prompts or the model's
+responses passes through it.
+
+You can point the agent at a different control plane with
+`DOODLEIQ_CONTROL_PLANE_URL` (see [`PROTOCOL.md`](PROTOCOL.md) for the contract a
+compatible server must implement). The current build hard-requires a Cloudflare
+Tunnel token from that server for ingress.
+
 ## Install
 
 macOS and Linux:
@@ -78,7 +95,7 @@ no OpenSSL.
 
 | Variable | Purpose |
 |---|---|
-| `DOODLEIQ_CONTROL_PLANE_URL` | control plane base URL (default `https://api.doodleiq.com`) |
+| `DOODLEIQ_CONTROL_PLANE_URL` | control plane base URL (default `https://api.doodleiq.com`); see [`PROTOCOL.md`](PROTOCOL.md) |
 | `DOODLEIQ_MODEL_API_KEY` | bearer token for your model runtime, if it needs one |
 | `DOODLEIQ_CONFIG_DIR` | override the config directory (default `~/.config/doodleiq`) |
 

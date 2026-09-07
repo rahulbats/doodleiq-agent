@@ -1,6 +1,6 @@
 [package]
 name = "doodleiq"
-version = "0.1.2"
+version = "0.1.3"
 description = "DoodleIQ local inference provider gateway"
 authors = ["DoodleIQ"]
 license = "MIT"

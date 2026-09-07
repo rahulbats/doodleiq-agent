@@ -40,6 +40,12 @@ const PROVIDER_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 const HEARTBEAT_RETRY_BACKOFF_SECONDS: [u64; 2] = [3, 7];
 const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.doodleiq.com";
 
+/// Shown when the control plane no longer recognizes this machine's pairing —
+/// i.e. the provider removed it from their account in the dashboard.
+const DEVICE_DELISTED_MESSAGE: &str = "this machine was removed from your DoodleIQ account. \
+Run `doodleiq reset`, then `doodleiq pair` to reconnect it (re-run `doodleiq configure` \
+first if your model runtime moved).";
+
 /// Rolling view of whether heartbeats to the control plane are landing, surfaced
 /// on the agent's local `/health` endpoint and in the terminal.
 #[derive(Default)]
@@ -1021,6 +1027,9 @@ async fn resume_provider_tunnel(
         .send()
         .await
         .map_err(|err| format!("Unable to restore provider tunnel: {err}"))?;
+    if matches!(response.status().as_u16(), 404 | 410) {
+        return Err(DEVICE_DELISTED_MESSAGE.to_string());
+    }
     if !response.status().is_success() {
         return Err(format!("Pairing service returned {}", response.status()));
     }
@@ -1077,10 +1086,26 @@ async fn post_provider_heartbeat_once(
         .send()
         .await
         .map_err(|err| format!("Unable to update provider availability: {err}"))?;
+    if matches!(response.status().as_u16(), 401 | 404 | 410) {
+        return Err(DEVICE_DELISTED_MESSAGE.to_string());
+    }
     if !response.status().is_success() {
         return Err(format!("Heartbeat service returned {}", response.status()));
     }
-    Ok(format!("{}.doodleiq.com", config.provider_id))
+    // The control plane owns the hostname (`<device_id>.doodleiq.com`); trust its
+    // response and fall back to the device-id form only for an older API build.
+    let hostname = response
+        .json::<Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body.get("hostname")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| format!("{}.doodleiq.com", config.device_id));
+    Ok(hostname)
 }
 
 /// Send a heartbeat, retrying transient failures within the tick so a brief
@@ -1156,9 +1181,21 @@ async fn run_provider_heartbeat(
     state: GatewayState,
     cloudflared_state: CloudflaredState,
     heartbeat_state: ProviderHeartbeatState,
-) {
+) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    // Every heartbeat send funnels through here so that "this machine was
+    // delisted" (control plane returns 401/404) stops the loop cleanly instead
+    // of being logged and retried forever against an account that dropped it.
+    macro_rules! heartbeat {
+        ($($args:tt)*) => {
+            match post_provider_heartbeat($($args)*).await {
+                Err(err) if err == DEVICE_DELISTED_MESSAGE => return Err(err),
+                other => other,
+            }
+        };
+    }
 
     let mut interval =
         tokio::time::interval(Duration::from_secs(PROVIDER_HEARTBEAT_INTERVAL_SECONDS));
@@ -1210,23 +1247,20 @@ async fn run_provider_heartbeat(
                         .as_ref()
                         .expect("target checked above")
                         .model_id;
-                    if let Err(err) = post_provider_heartbeat(
+                    if let Err(err) = heartbeat!(
                         old_model_id,
                         false,
                         false,
                         Some("model_switch"),
                         &state,
                         &cloudflared_state,
-                    )
-                    .await
-                    {
+                    ) {
                         log::warn!("unable to unpublish replaced model: {err}");
                         continue;
                     }
                 }
                 if let Err(err) =
-                    post_provider_heartbeat(&model_id, true, true, None, &state, &cloudflared_state)
-                        .await
+                    heartbeat!(&model_id, true, true, None, &state, &cloudflared_state)
                 {
                     log::warn!("background provider heartbeat failed: {err}");
                 } else {
@@ -1246,21 +1280,19 @@ async fn run_provider_heartbeat(
                     + 1;
                 if streak < PROVIDER_MODEL_GONE_DEBOUNCE {
                     if let Some(target) = current_target.as_ref() {
-                        if let Err(err) = post_provider_heartbeat(
+                        if let Err(err) = heartbeat!(
                             &target.model_id,
                             true,
                             false,
                             Some("model_reloading"),
                             &state,
                             &cloudflared_state,
-                        )
-                        .await
-                        {
+                        ) {
                             log::warn!("background provider heartbeat failed: {err}");
                         }
                     }
                 } else if let Some(target) = current_target {
-                    if post_provider_heartbeat(
+                    if heartbeat!(
                         &target.model_id,
                         false,
                         false,
@@ -1268,7 +1300,6 @@ async fn run_provider_heartbeat(
                         &state,
                         &cloudflared_state,
                     )
-                    .await
                     .is_ok()
                     {
                         *heartbeat_state.target.write().await = None;
@@ -2115,7 +2146,8 @@ async fn run_agent(state: GatewayState) -> Result<(), String> {
             terminal_task.abort();
             heartbeat_watch_task.abort();
             match result {
-                Ok(()) => Some("heartbeat loop ended unexpectedly".to_string()),
+                Ok(Ok(())) => Some("heartbeat loop ended unexpectedly".to_string()),
+                Ok(Err(reason)) => Some(reason),
                 Err(join) => Some(format!("heartbeat loop panicked: {join}")),
             }
         }
@@ -2147,6 +2179,11 @@ async fn run_agent(state: GatewayState) -> Result<(), String> {
 
     if let Some(reason) = shutdown_reason {
         log::error!("{reason}");
+        if reason == DEVICE_DELISTED_MESSAGE {
+            // Not a crash — the provider removed this machine. A restart would
+            // just fail the same way, so return the message plainly.
+            return Err(reason);
+        }
         Err(format!(
             "{reason}: the provider agent is stopping so a supervisor can restart it"
         ))
