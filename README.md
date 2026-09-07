@@ -98,6 +98,7 @@ no OpenSSL.
 | `DOODLEIQ_CONTROL_PLANE_URL` | control plane base URL (default `https://api.doodleiq.com`); see [`PROTOCOL.md`](PROTOCOL.md) |
 | `DOODLEIQ_MODEL_API_KEY` | bearer token for your model runtime, if it needs one |
 | `DOODLEIQ_CONFIG_DIR` | override the config directory (default `~/.config/doodleiq`) |
+| `DOODLEIQ_MACHINE_NAME` / `DOODLEIQ_MACHINE_MODEL` / `DOODLEIQ_MACHINE_LOCATION` | override the machine labels shown on your listing. The model is auto-detected from `nvidia-smi` (works inside a rented container); set these when the auto values are wrong or missing — e.g. name/timezone in a container |
 
 ## Releases
 

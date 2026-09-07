@@ -194,7 +194,18 @@ fn compute_machine_identity() -> MachineIdentity {
     }
 }
 
+/// Read a non-empty env override, trimmed.
+fn env_override(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn machine_name() -> String {
+    if let Some(value) = env_override("DOODLEIQ_MACHINE_NAME") {
+        return value;
+    }
     #[cfg(target_os = "macos")]
     if let Some(value) = command_output("scutil", &["--get", "ComputerName"]) {
         return value;
@@ -214,9 +225,44 @@ fn machine_name() -> String {
         .unwrap_or_else(|| "DoodleIQ provider".to_string())
 }
 
+/// Condense `nvidia-smi --query-gpu=name` output into one label, e.g.
+/// `2× RTX 4070 Ti SUPER`. Passthrough means this works inside a rented
+/// container even when DMI only sees the host motherboard.
+fn summarize_gpu_names(raw: &str) -> Option<String> {
+    let names: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let first = names.first()?;
+    let short = first
+        .trim_start_matches("NVIDIA GeForce ")
+        .trim_start_matches("NVIDIA ")
+        .trim();
+    if short.is_empty() {
+        return None;
+    }
+    if names.len() > 1 && names.iter().all(|name| name == first) {
+        Some(format!("{}\u{00d7} {short}", names.len()))
+    } else if names.len() > 1 {
+        Some(format!("{} GPUs", names.len()))
+    } else {
+        Some(short.to_string())
+    }
+}
+
 fn machine_model() -> String {
+    if let Some(value) = env_override("DOODLEIQ_MACHINE_MODEL") {
+        return value;
+    }
     #[cfg(target_os = "macos")]
     if let Some(value) = command_output("sysctl", &["-n", "hw.model"]) {
+        return value;
+    }
+    // A GPU box is the common case — nvidia-smi survives container passthrough.
+    if let Some(value) = command_output("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
+        .and_then(|raw| summarize_gpu_names(&raw))
+    {
         return value;
     }
     #[cfg(target_os = "linux")]
@@ -242,6 +288,9 @@ fn machine_model() -> String {
 }
 
 fn machine_location() -> String {
+    if let Some(value) = env_override("DOODLEIQ_MACHINE_LOCATION") {
+        return value;
+    }
     if let Ok(tz) = std::env::var("TZ") {
         let tz = tz.trim();
         if !tz.is_empty() {
@@ -2350,5 +2399,19 @@ mod tests {
         assert!(next_session.consumer_connected);
         assert_eq!(next_session.requests, 0);
         assert_eq!(next_session.total_tokens, 0);
+    }
+
+    #[test]
+    fn summarizes_gpu_names() {
+        assert_eq!(
+            summarize_gpu_names("NVIDIA GeForce RTX 4070 Ti SUPER\nNVIDIA GeForce RTX 4070 Ti SUPER")
+                .as_deref(),
+            Some("2\u{00d7} RTX 4070 Ti SUPER")
+        );
+        assert_eq!(
+            summarize_gpu_names("NVIDIA A100-SXM4-80GB\n").as_deref(),
+            Some("A100-SXM4-80GB")
+        );
+        assert_eq!(summarize_gpu_names("   \n  ").as_deref(), None);
     }
 }

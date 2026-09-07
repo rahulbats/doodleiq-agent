@@ -129,8 +129,9 @@ sends no explicit "I'm alive" beyond this.
 
 ## 4. `POST /v1/devices/{device_id}/inference-grants/validate` — check a consumer's grant
 
-Auth: `X-DoodleIQ-Pairing-Token`. Called by the gateway on the **first** request
-of a consumer session (the consumer presents `Authorization: Bearer <grant_id>.<request_token>`).
+Auth: `X-DoodleIQ-Pairing-Token`. Called by the gateway on **every** proxied
+request (the consumer presents `Authorization: Bearer <grant_id>.<request_token>`),
+so a revoked or expired grant stops working immediately.
 
 ```jsonc
 // request
@@ -238,8 +239,9 @@ This is what consumers actually talk to (through the tunnel).
 
 Proxy behaviour:
 
-- Requires `Authorization: Bearer <grant_id>.<request_token>`; validated once per
-  session via endpoint 4, then cached until expiry.
+- Requires `Authorization: Bearer <grant_id>.<request_token>`; **every** proxied
+  request re-validates it against endpoint 4, so a revoked or expired grant stops
+  working immediately.
 - For a streaming `POST /v1/chat/completions`, injects
   `stream_options.include_usage` so the terminal `usage` block can be metered.
 - Buffers the request body (bounded at 32 MiB), forwards to the runtime host from

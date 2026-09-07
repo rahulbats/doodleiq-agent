@@ -6,3 +6,6 @@
 # Local release build (packaging/release-local.sh)
 /dist/
 /.cargo-docker/
+
+# Real env files are ignored repo-wide; the template is safe to track.
+!.env.example
