@@ -1261,16 +1261,18 @@ async fn run_provider_heartbeat(
         let config = state.config.read().await.clone();
         let current_target = heartbeat_state.target.read().await.clone();
 
-        // 1. Resolve which model this provider is actually serving.
+        // 1. Resolve which model this provider is actually serving. Anything
+        // other than a concrete model — no model loaded, runtime unreachable,
+        // runtime erroring — falls into the debounce path below: a brief blip is
+        // tolerated, but a runtime that stays down eventually delists the model
+        // and closes the session instead of serving 502s forever.
         let discovered = match discover_loaded_model(&config, &state.client).await {
             Ok(model_id) => Some(model_id),
-            Err(err) if err == "the model runtime has no loaded model" => None,
-            // A transient network/runtime error must never flip the provider
-            // offline — treat it as "keep last known model available" so a
-            // brief hiccup does not take the marketplace listing down.
             Err(err) => {
-                log::warn!("unable to refresh the loaded model: {err}");
-                current_target.clone().map(|target| target.model_id)
+                if err != "the model runtime has no loaded model" {
+                    log::warn!("model runtime not serving: {err}");
+                }
+                None
             }
         };
 
@@ -1279,9 +1281,9 @@ async fn run_provider_heartbeat(
                 // Provider is serving a concrete model: reset the debounce streak
                 // and keep it online. If the served model changed, unpublish the
                 // old one first *without* closing grants, then publish the new one.
-                heartbeat_state
-                    .model_gone_streak
-                    .store(0, Ordering::Relaxed);
+                if heartbeat_state.model_gone_streak.swap(0, Ordering::Relaxed) > 0 {
+                    println!("\u{2713} model runtime back \u{2014} serving {model_id}");
+                }
                 // Only advertise online when the public transport is actually up.
                 // Heal the tunnel first so a crashed connector does not publish an
                 // unusable "online" state.
@@ -1327,6 +1329,14 @@ async fn run_provider_heartbeat(
                     .model_gone_streak
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
+                if streak == 1 && current_target.is_some() {
+                    println!(
+                        "\n\u{26a0} model runtime not responding \u{2014} the listing is hidden; \
+                         it delists and any session ends if this continues."
+                    );
+                } else if streak == PROVIDER_MODEL_GONE_DEBOUNCE && current_target.is_some() {
+                    println!("\u{26a0} model runtime still down \u{2014} delisting and closing the session.");
+                }
                 if streak < PROVIDER_MODEL_GONE_DEBOUNCE {
                     if let Some(target) = current_target.as_ref() {
                         if let Err(err) = heartbeat!(

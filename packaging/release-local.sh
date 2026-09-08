@@ -39,6 +39,11 @@ mkdir -p "$dist/archives" "$dist/root"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m!!  %s\033[0m\n' "$*" >&2; }
 
+# Without this, macOS `tar` (bsdtar) embeds Apple xattrs (com.apple.provenance)
+# as LIBARCHIVE.xattr.* pax headers, and GNU tar on Linux prints a warning per
+# file on extract. `--no-xattrs` is understood by both bsdtar and GNU tar.
+tar_flags="--no-xattrs"
+
 # ---------------------------------------------------------------- macOS universal
 if [ "$(uname -s)" = "Darwin" ]; then
   say "macOS universal build"
@@ -72,7 +77,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   fi
 
   cp -R packaging DISTRIBUTION.md "$stage/"
-  ( cd "$dist" && tar -czf "archives/doodleiq-macos-universal.tar.gz" "doodleiq-macos-universal" )
+  ( cd "$dist" && tar $tar_flags -czf "archives/doodleiq-macos-universal.tar.gz" "doodleiq-macos-universal" )
   rm -rf "$stage"
 else
   warn "not on macOS — skipping the macOS build"
@@ -102,7 +107,7 @@ if [ -n "${LINUX_TARGETS// /}" ] && command -v docker >/dev/null 2>&1; then
     mkdir -p "$stage"
     cp "target/$target/release/doodleiq" "$stage/"
     cp -R packaging DISTRIBUTION.md "$stage/"
-    ( cd "$dist" && tar -czf "archives/doodleiq-$slug.tar.gz" "doodleiq-$slug" )
+    ( cd "$dist" && tar $tar_flags -czf "archives/doodleiq-$slug.tar.gz" "doodleiq-$slug" )
     rm -rf "$stage"
   done
 elif [ -z "${LINUX_TARGETS// /}" ]; then
