@@ -12,10 +12,11 @@ use futures_util::StreamExt;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -38,7 +39,22 @@ const PROVIDER_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 /// well under the tick interval means a control-plane restart (a few seconds of
 /// connection-refused) is absorbed without the marketplace ever seeing a gap.
 const HEARTBEAT_RETRY_BACKOFF_SECONDS: [u64; 2] = [3, 7];
+/// How long the tunnel stays up with zero active conversations before it's
+/// closed — long enough that normal thinking-time pauses between chat
+/// messages never trip it, short enough to meaningfully cut how long this
+/// machine is publicly reachable when nobody's using it. Once closed this way
+/// it stays down for good (see CloudflaredState::idle_closed) rather than
+/// being relaunched on the next heartbeat: there's no way for this process to
+/// detect "a customer is trying to connect" while the tunnel is down (nothing
+/// can route to it without the tunnel already up), so blindly relaunching on
+/// a timer just flaps the tunnel up and down forever with no real benefit.
+const TUNNEL_IDLE_GRACE_SECONDS: u64 = 600;
 const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.doodleiq.com";
+
+// Styling for the "Consumer connected."/"Consumer disconnected." notices
+// printed by `run` (see `run_terminal_ui`).
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_DIM: &str = "\x1b[2m";
 
 /// Shown when the control plane no longer recognizes this machine's pairing —
 /// i.e. the provider removed it from their account in the dashboard.
@@ -304,8 +320,10 @@ fn machine_location() -> String {
 
 #[derive(Debug, Deserialize)]
 struct GrantValidation {
-    model_id: String,
-    max_tokens: u64,
+    // Rental-specific; absent (JSON null) when this validated a job engagement
+    // rather than an inference grant.
+    model_id: Option<String>,
+    max_tokens: Option<u64>,
     expires_at: String,
     expires_at_epoch: u64,
     started_at_epoch: u64,
@@ -385,19 +403,28 @@ impl UsageMeter {
         }
     }
 
-    fn note_consumer_activity(&self, grant_id: &str, expires_at: u64, started_at: u64) {
-        if let Ok(mut active_grant_id) = self.active_grant_id.lock() {
-            if active_grant_id.as_deref() != Some(grant_id) {
-                self.reset_counters();
+    /// Returns true the first time this session becomes the active one — a
+    /// caller can use that to print a one-time "Consumer connected" notice
+    /// instead of re-announcing it on every request in the same session.
+    fn note_consumer_activity(&self, grant_id: &str, expires_at: u64, started_at: u64) -> bool {
+        let is_new_session = match self.active_grant_id.lock() {
+            Ok(mut active_grant_id) => {
+                let is_new = active_grant_id.as_deref() != Some(grant_id);
+                if is_new {
+                    self.reset_counters();
+                }
+                *active_grant_id = Some(grant_id.to_string());
+                is_new
             }
-            *active_grant_id = Some(grant_id.to_string());
-        }
+            Err(_) => false,
+        };
         self.last_consumer_activity
             .store(unix_timestamp(), Ordering::Relaxed);
         self.consumer_expires_at
             .store(expires_at, Ordering::Relaxed);
         self.consumer_connected_at
             .store(started_at, Ordering::Relaxed);
+        is_new_session
     }
 
     fn disconnect(&self, grant_id: &str) -> bool {
@@ -456,6 +483,65 @@ struct GatewayState {
     /// Ed25519 device key, loaded once at startup. Every usage receipt is
     /// signed with it, so it must not be re-read from disk per request.
     signing_key: Arc<SigningKey>,
+    /// "Consumer connected."/"Consumer disconnected." notices, sent here
+    /// instead of printed directly by the request handler so `run_terminal_ui`
+    /// stays the sole writer to stdout while `run` is active. Message content
+    /// itself isn't handled here at all — the customer's browser persists the
+    /// transcript straight to the API (see JobEngagementMessage), and both
+    /// dashboards read it from there.
+    status_lines: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Tracks whether any consumer session (rental or job-engagement) is
+    /// currently active, so the heartbeat loop knows when it's safe to close
+    /// the tunnel. Separate from `UsageMeter`, which only ever tracks one
+    /// "most recently active" session for the terminal's display — a device
+    /// can serve several concurrent job-engagement conversations (e.g.
+    /// multiple customers getting quotes from the same business at once),
+    /// and closing the tunnel out from under one of them because a different
+    /// one just ended would be a real bug, not a display quirk.
+    sessions: Arc<SessionTracker>,
+}
+
+#[derive(Default)]
+struct SessionTracker {
+    last_activity: Mutex<HashMap<String, u64>>,
+    last_reconnect: AtomicU64,
+}
+
+impl SessionTracker {
+    fn touch(&self, session_key: &str) {
+        if let Ok(mut map) = self.last_activity.lock() {
+            map.insert(session_key.to_string(), unix_timestamp());
+        }
+    }
+
+    fn forget(&self, session_key: &str) {
+        if let Ok(mut map) = self.last_activity.lock() {
+            map.remove(session_key);
+        }
+    }
+
+    fn note_reconnect(&self) {
+        self.last_reconnect.store(unix_timestamp(), Ordering::Relaxed);
+    }
+
+    /// True once neither any tracked session's activity nor the tunnel's own
+    /// last reconnect is within `grace_seconds` of now. Anchoring on the
+    /// reconnect time too (not just session activity) means a tunnel that
+    /// just came back up gets one full grace period to attract a new
+    /// conversation before it's eligible to be closed again — otherwise an
+    /// idle device would tear down and relaunch the tunnel on every single
+    /// heartbeat tick. A session a customer simply walks away from (no
+    /// explicit disconnect ever arrives) still ages out here since this is
+    /// time-based, not presence-based.
+    fn idle_for_at_least(&self, grace_seconds: u64) -> bool {
+        let Ok(map) = self.last_activity.lock() else {
+            return false;
+        };
+        let now = unix_timestamp();
+        let last_activity = map.values().copied().max().unwrap_or(0);
+        let last_reconnect = self.last_reconnect.load(Ordering::Relaxed);
+        now.saturating_sub(last_activity.max(last_reconnect)) >= grace_seconds
+    }
 }
 
 #[derive(Clone, Default)]
@@ -467,6 +553,12 @@ struct CloudflaredState {
     /// never held across an `.await`. Per Tokio's own guidance, a blocking mutex
     /// is the right primitive here; `tokio::sync::Mutex` would only add overhead.
     process: Arc<Mutex<Option<Child>>>,
+    /// Set when the heartbeat loop closes the tunnel for idleness — as
+    /// opposed to it merely not being running yet, or having crashed.
+    /// `ensure_tunnel_healthy` checks this to avoid undoing a deliberate idle
+    /// close on the very next tick; `launch_cloudflared` clears it on any
+    /// successful (re)launch, so a genuine crash still auto-heals normally.
+    idle_closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -691,6 +783,7 @@ fn launch_cloudflared(tunnel_token: &str, state: &CloudflaredState) -> Result<()
     if !cloudflared_running(state) {
         return Err("cloudflared exited before establishing the managed tunnel".to_string());
     }
+    state.idle_closed.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1037,6 +1130,12 @@ async fn ensure_tunnel_healthy(state: &GatewayState, cloudflared_state: &Cloudfl
     if cloudflared_running(cloudflared_state) {
         return true;
     }
+    if cloudflared_state.idle_closed.load(Ordering::Relaxed) {
+        // Deliberately closed for idleness, not crashed — leave it down. See
+        // TUNNEL_IDLE_GRACE_SECONDS for why relaunching here would just flap
+        // the tunnel forever instead of actually saving anything.
+        return false;
+    }
     log::warn!("managed Cloudflare tunnel is not running; attempting to relaunch");
     match resume_provider_tunnel(state, cloudflared_state).await {
         Ok(true) => {
@@ -1091,6 +1190,7 @@ async fn resume_provider_tunnel(
     };
     ensure_cloudflared(&state.client).await?;
     launch_cloudflared(&tunnel_token, cloudflared_state)?;
+    state.sessions.note_reconnect();
     Ok(true)
 }
 
@@ -1261,6 +1361,25 @@ async fn run_provider_heartbeat(
         let config = state.config.read().await.clone();
         let current_target = heartbeat_state.target.read().await.clone();
 
+        // 0. Close the tunnel once nothing has used it for a while — see
+        // TUNNEL_IDLE_GRACE_SECONDS. This is a final disconnect, not a pause:
+        // idle_closed stops the health check below from relaunching it, so
+        // this machine stays unreachable until the app itself is restarted.
+        if cloudflared_running(&cloudflared_state)
+            && state.sessions.idle_for_at_least(TUNNEL_IDLE_GRACE_SECONDS)
+        {
+            if let Err(err) = stop_cloudflared(&cloudflared_state) {
+                log::warn!("unable to close idle tunnel: {err}");
+            } else {
+                cloudflared_state.idle_closed.store(true, Ordering::Relaxed);
+                println!(
+                    "Disconnected \u{2014} tunnel closed after {} minutes with no active conversation. Restart to reconnect.",
+                    TUNNEL_IDLE_GRACE_SECONDS / 60
+                );
+            }
+            continue;
+        }
+
         // 1. Resolve which model this provider is actually serving. Anything
         // other than a concrete model — no model loaded, runtime unreachable,
         // runtime erroring — falls into the debounce path below: a brief blip is
@@ -1369,31 +1488,14 @@ async fn run_provider_heartbeat(
     }
 }
 
-async fn report_terminal_usage(meter: Arc<UsageMeter>) {
-    use std::io::Write;
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-    let mut was_connected = false;
-    loop {
-        interval.tick().await;
-        let snapshot = meter.snapshot();
-        if snapshot.consumer_connected {
-            if !was_connected {
-                was_connected = true;
-            }
-            print!(
-                "\x1b[2K\rConsumer connected (time: {} seconds)\n\x1b[2K\rInput: {} | output: {} | tokens/sec: {:.2}\x1b[1A",
-                snapshot.consumer_connected_seconds,
-                snapshot.input_tokens,
-                snapshot.output_tokens,
-                snapshot.tokens_per_second
-            );
-            let _ = std::io::stdout().flush();
-        } else if was_connected {
-            println!("\x1b[1B");
-            println!("Consumer disconnected. Waiting for connection...");
-            was_connected = false;
-        }
+/// Sole writer to stdout while `run` is active: prints "Consumer
+/// connected."/"Consumer disconnected." notices as they arrive on
+/// `status_lines_rx`. Conversation content itself isn't handled here —
+/// the customer's browser persists the transcript straight to the API, and
+/// both dashboards read it from there (see JobEngagementMessage).
+async fn run_terminal_ui(mut status_lines_rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
+    while let Some(line) = status_lines_rx.recv().await {
+        println!("{line}");
     }
 }
 
@@ -1561,32 +1663,51 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
             "the local model runtime is not configured; run `doodleiq configure`",
         );
     }
-    let Some((grant_id, request_token)) = inference_grant(request.headers()) else {
+    let Some(credential) = session_credential(request.headers()) else {
         return json_error(
             StatusCode::UNAUTHORIZED,
-            "a DoodleIQ inference grant is required",
+            "a DoodleIQ inference grant or job engagement session is required",
         );
     };
-    let validation =
-        match validate_inference_grant(&state, &config, &grant_id, &request_token).await {
-            Ok(validation) => validation,
-            Err(message) => {
-                // The grant is no longer valid (expired, reaped for idleness, or
-                // already closed). If it corresponds to the consumer session this
-                // gateway is currently tracking, clear the local "connected" state
-                // so the terminal stops showing "Consumer connected". Otherwise an
-                // idle consumer that is kicked out server-side would leave the CLI
-                // streaming "connected" indefinitely with no way to learn the grant
-                // was closed.
-                state.meter.disconnect(&grant_id);
-                return json_error(StatusCode::UNAUTHORIZED, &message);
+    let validation = match validate_inference_grant(&state, &config, &credential).await {
+        Ok(validation) => validation,
+        Err(GrantValidationError::Unauthorized(message)) => {
+            // The session is no longer valid (expired, reaped for idleness, or
+            // already closed). If it corresponds to the consumer session this
+            // gateway is currently tracking, clear the local "connected" state
+            // and announce it — otherwise an idle consumer that is kicked out
+            // server-side would leave the CLI silently claiming a session that
+            // no longer exists.
+            state.sessions.forget(credential.session_key());
+            if state.meter.disconnect(credential.session_key())
+                && matches!(credential, SessionCredential::JobEngagement { .. })
+            {
+                let _ = state
+                    .status_lines
+                    .send(format!("{ANSI_DIM}Consumer disconnected.{ANSI_RESET}"));
             }
-        };
-    state.meter.note_consumer_activity(
-        &grant_id,
+            return json_error(StatusCode::UNAUTHORIZED, &message);
+        }
+        Err(GrantValidationError::Unavailable(message)) => {
+            // Couldn't confirm the session is invalid — don't tear it down or
+            // tell the consumer their conversation is over over a transient
+            // control-plane hiccup; let them retry the same session.
+            return json_error(StatusCode::BAD_GATEWAY, &message);
+        }
+    };
+    state.sessions.touch(credential.session_key());
+    // Announced once per session (not per request) — see
+    // UsageMeter::note_consumer_activity's return value.
+    if state.meter.note_consumer_activity(
+        credential.session_key(),
         validation.expires_at_epoch,
         validation.started_at_epoch,
-    );
+    ) && matches!(credential, SessionCredential::JobEngagement { .. })
+    {
+        let _ = state
+            .status_lines
+            .send(format!("{ANSI_DIM}Consumer connected.{ANSI_RESET}"));
+    }
 
     let (parts, body) = request.into_parts();
     // The body is buffered (not streamed) on purpose: a streaming chat
@@ -1613,6 +1734,15 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
     if !config.api_key.trim().is_empty() {
         upstream = upstream.header(header::AUTHORIZATION, format!("Bearer {}", config.api_key));
     }
+    // Lets the local agent process call the marketplace API's agent-tools
+    // endpoints (upload/download shared artifacts, submit a quote) directly,
+    // using the exact same per-conversation credential this request was
+    // authenticated with — no separate credential to mint or manage.
+    if let SessionCredential::JobEngagement { id, token } = &credential {
+        upstream = upstream
+            .header("x-doodleiq-job-engagement", format!("job:{id}.{token}"))
+            .header("x-doodleiq-control-plane", control_plane_url());
+    }
     if !body.is_empty() {
         upstream = upstream.body(body);
     }
@@ -1635,8 +1765,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
         let meter = state.meter.clone();
         let receipt_state = state.clone();
         let receipt_config = config.clone();
-        let receipt_grant_id = grant_id.clone();
-        let receipt_token = request_token.clone();
+        let receipt_credential = credential.clone();
         let stream = upstream.bytes_stream().scan(
             (Vec::<u8>::new(), false),
             move |(buffer, recorded), chunk| {
@@ -1647,15 +1776,13 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
                             let receipt_meter = meter.clone();
                             let receipt_state = receipt_state.clone();
                             let receipt_config = receipt_config.clone();
-                            let receipt_grant_id = receipt_grant_id.clone();
-                            let receipt_token = receipt_token.clone();
+                            let receipt_credential = receipt_credential.clone();
                             let duration_ms = started_at.elapsed().as_millis() as u64;
                             tokio::spawn(async move {
                                 if let Err(err) = submit_usage_receipt(
                                     &receipt_state,
                                     &receipt_config,
-                                    &receipt_grant_id,
-                                    &receipt_token,
+                                    &receipt_credential,
                                     usage,
                                     duration_ms,
                                     "completed",
@@ -1692,8 +1819,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
         if let Err(err) = submit_usage_receipt(
             &state,
             &config,
-            &grant_id,
-            &request_token,
+            &credential,
             usage,
             started_at.elapsed().as_millis() as u64,
             if status.is_success() {
@@ -1714,25 +1840,109 @@ async fn proxy(State(state): State<GatewayState>, request: Request) -> Response<
     build_response(status, &response_headers, Body::from(bytes))
 }
 
-fn inference_grant(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
+/// Either kind of session a consumer can present at the gateway. The wire
+/// format is `{id}.{token}` for a rental (unchanged, so nothing about the
+/// live inference-rental flow is disturbed), or `job:{id}.{token}` for a job
+/// engagement conversation. Everything downstream — validation, usage
+/// reporting, the local UsageMeter key — only needs `session_key()`/
+/// `token()`; it never needs to know which kind it has beyond picking the
+/// right JSON field name to send.
+#[derive(Debug, Clone)]
+enum SessionCredential {
+    Grant { id: String, token: String },
+    JobEngagement { id: String, token: String },
+}
+
+impl SessionCredential {
+    fn session_key(&self) -> &str {
+        match self {
+            SessionCredential::Grant { id, .. } => id,
+            SessionCredential::JobEngagement { id, .. } => id,
+        }
+    }
+
+    fn token(&self) -> &str {
+        match self {
+            SessionCredential::Grant { token, .. } => token,
+            SessionCredential::JobEngagement { token, .. } => token,
+        }
+    }
+}
+
+fn session_credential(headers: &HeaderMap) -> Option<SessionCredential> {
+    let raw = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|credential| credential.split_once('.'))
-        .filter(|(grant_id, token)| !grant_id.is_empty() && token.len() >= 20)
-        .map(|(grant_id, token)| (grant_id.to_string(), token.to_string()))
+        .map(str::trim)
+        // Accept "Bearer <key>" (any casing / extra spaces) or a bare key —
+        // consumers paste these into all sorts of clients.
+        .map(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .unwrap_or(value)
+                .trim()
+        })?;
+    let (is_job_engagement, credential) = match raw.strip_prefix("job:") {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let (id, token) = credential.split_once('.')?;
+    let (id, token) = (id.trim(), token.trim());
+    if id.is_empty() || token.len() < 20 {
+        return None;
+    }
+    Some(if is_job_engagement {
+        SessionCredential::JobEngagement {
+            id: id.to_string(),
+            token: token.to_string(),
+        }
+    } else {
+        SessionCredential::Grant {
+            id: id.to_string(),
+            token: token.to_string(),
+        }
+    })
+}
+
+/// `validate_inference_grant` can fail two very differently-meaning ways,
+/// and collapsing them into one error used to mean any transient hiccup
+/// (a network blip to the control plane, a 5xx, a deadlock-driven timeout)
+/// was indistinguishable from the session actually being over — the proxy
+/// returned 401 either way, which the consumer's browser renders as "This
+/// conversation has ended," permanently, for what was really just a retry
+/// away from working.
+enum GrantValidationError {
+    /// The control plane explicitly says this credential is no longer good
+    /// (bad token, wrong device, or a job-engagement status the tunnel
+    /// doesn't accept anymore) — safe to treat as session-over.
+    Unauthorized(String),
+    /// Couldn't reach the control plane, or it didn't return a clean
+    /// 401/404 — a 5xx, a timeout, a malformed body. Transient: the session
+    /// itself may still be perfectly valid.
+    Unavailable(String),
 }
 
 async fn validate_inference_grant(
     state: &GatewayState,
     config: &RuntimeConfig,
-    grant_id: &str,
-    request_token: &str,
-) -> Result<GrantValidation, String> {
+    credential: &SessionCredential,
+) -> Result<GrantValidation, GrantValidationError> {
     if config.device_id.is_empty() || config.pairing_token.is_empty() {
-        return Err("the provider device is not paired".to_string());
+        return Err(GrantValidationError::Unauthorized(
+            "the provider device is not paired".to_string(),
+        ));
     }
+    let body = match credential {
+        SessionCredential::Grant { id, token } => json!({
+            "grant_id": id,
+            "request_token": token,
+        }),
+        SessionCredential::JobEngagement { id, token } => json!({
+            "job_engagement_id": id,
+            "request_token": token,
+        }),
+    };
     let response = state
         .client
         .post(format!(
@@ -1741,30 +1951,29 @@ async fn validate_inference_grant(
             config.device_id
         ))
         .header("X-DoodleIQ-Pairing-Token", &config.pairing_token)
-        .json(&json!({
-            "grant_id": grant_id,
-            "request_token": request_token,
-        }))
+        .json(&body)
         .send()
         .await
-        .map_err(|err| format!("unable to validate inference grant: {err}"))?;
+        .map_err(|err| GrantValidationError::Unavailable(format!("unable to validate session: {err}")))?;
     if !response.status().is_success() {
         let status = response.status();
         let detail = response
             .text()
             .await
             .unwrap_or_else(|_| "unable to read validation response".to_string());
-        log::warn!("inference grant validation failed: {status}: {detail}");
-        return Err(format!(
-            "DoodleIQ API key validation failed ({status}): {detail}"
-        ));
+        log::warn!("session validation failed: {status}: {detail}");
+        let message = format!("DoodleIQ API key validation failed ({status}): {detail}");
+        return Err(if matches!(status.as_u16(), 401 | 404) {
+            GrantValidationError::Unauthorized(message)
+        } else {
+            GrantValidationError::Unavailable(message)
+        });
     }
-    let validation: GrantValidation = response
-        .json()
-        .await
-        .map_err(|err| format!("invalid grant validation response: {err}"))?;
+    let validation: GrantValidation = response.json().await.map_err(|err| {
+        GrantValidationError::Unavailable(format!("invalid validation response: {err}"))
+    })?;
     log::info!(
-        "validated inference grant model={} max_tokens={} expires_at={}",
+        "validated session model={:?} max_tokens={:?} expires_at={}",
         validation.model_id,
         validation.max_tokens,
         validation.expires_at
@@ -1775,31 +1984,42 @@ async fn validate_inference_grant(
 async fn submit_usage_receipt(
     state: &GatewayState,
     config: &RuntimeConfig,
-    grant_id: &str,
-    request_token: &str,
+    credential: &SessionCredential,
     usage: TokenUsage,
     duration_ms: u64,
     status: &str,
 ) -> Result<(), String> {
     let request_id = format!(
         "{}-{}",
-        grant_id,
+        credential.session_key(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_nanos()
     );
-    let body = serde_json::to_vec(&json!({
-        "grant_id": grant_id,
-        "request_token": request_token,
+    let fields = json!({
+        "request_token": credential.token(),
         "request_id": request_id,
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens,
         "duration_ms": duration_ms,
         "status": status,
-    }))
-    .map_err(|err| format!("unable to serialize usage receipt: {err}"))?;
+    });
+    let payload = match credential {
+        SessionCredential::Grant { id, .. } => {
+            let mut fields = fields;
+            fields["grant_id"] = json!(id);
+            fields
+        }
+        SessionCredential::JobEngagement { id, .. } => {
+            let mut fields = fields;
+            fields["job_engagement_id"] = json!(id);
+            fields
+        }
+    };
+    let body = serde_json::to_vec(&payload)
+        .map_err(|err| format!("unable to serialize usage receipt: {err}"))?;
     let signature = state.signing_key.sign(&body);
     let response = state
         .client
@@ -2086,7 +2306,9 @@ and the device signing key — a full reset.")]
     },
 }
 
-fn gateway_state(config: RuntimeConfig) -> Result<GatewayState, String> {
+fn gateway_state(
+    config: RuntimeConfig,
+) -> Result<(GatewayState, tokio::sync::mpsc::UnboundedReceiver<String>), String> {
     // The upstream client must never impose a total-request timeout: an SSE
     // chat completion can legitimately stream tokens for many minutes. Only
     // cap how long we'll wait to establish the connection to the model runtime.
@@ -2094,14 +2316,20 @@ fn gateway_state(config: RuntimeConfig) -> Result<GatewayState, String> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|err| format!("Unable to initialize the upstream client: {err}"))?;
-    Ok(GatewayState {
-        config: Arc::new(RwLock::new(config)),
-        meter: Arc::new(UsageMeter::default()),
-        client: provider_http_client()?,
-        upstream,
-        heartbeat_health: Arc::new(HeartbeatHealth::default()),
-        signing_key: Arc::new(device_signing_key()?),
-    })
+    let (status_lines, status_lines_rx) = tokio::sync::mpsc::unbounded_channel();
+    Ok((
+        GatewayState {
+            config: Arc::new(RwLock::new(config)),
+            meter: Arc::new(UsageMeter::default()),
+            client: provider_http_client()?,
+            upstream,
+            heartbeat_health: Arc::new(HeartbeatHealth::default()),
+            signing_key: Arc::new(device_signing_key()?),
+            status_lines,
+            sessions: Arc::new(SessionTracker::default()),
+        },
+        status_lines_rx,
+    ))
 }
 
 pub async fn run_cli() -> Result<(), String> {
@@ -2118,7 +2346,7 @@ pub async fn run_cli() -> Result<(), String> {
     builder.init();
     let cli = Cli::parse();
     let config = load_config()?;
-    let state = gateway_state(config)?;
+    let (state, status_lines_rx) = gateway_state(config)?;
 
     match cli.command {
         CliCommand::Configure { url, api_key } => {
@@ -2146,14 +2374,17 @@ pub async fn run_cli() -> Result<(), String> {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
-        CliCommand::Run => run_agent(state).await?,
+        CliCommand::Run => run_agent(state, status_lines_rx).await?,
         CliCommand::Status => print_status(&state).await?,
         CliCommand::Reset { all } => reset_config(all)?,
     }
     Ok(())
 }
 
-async fn run_agent(state: GatewayState) -> Result<(), String> {
+async fn run_agent(
+    state: GatewayState,
+    status_lines_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> Result<(), String> {
     let config = state.config.read().await.clone();
     if config.url.trim().is_empty() {
         return Err("run `doodleiq configure` first".to_string());
@@ -2183,7 +2414,7 @@ async fn run_agent(state: GatewayState) -> Result<(), String> {
         cloudflared.clone(),
         heartbeat,
     ));
-    let terminal_task = tokio::spawn(report_terminal_usage(state.meter.clone()));
+    let terminal_task = tokio::spawn(run_terminal_ui(status_lines_rx));
     let heartbeat_watch_task =
         tokio::spawn(warn_on_heartbeat_health(state.heartbeat_health.clone()));
 
@@ -2377,6 +2608,49 @@ mod tests {
         assert_eq!(loaded_model_id(&payload).as_deref(), Some("llama3.2"));
     }
 
+    fn headers_with_bearer(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {value}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn parses_a_rental_grant_credential() {
+        let token = "a".repeat(20);
+        let headers = headers_with_bearer(&format!("grant-123.{token}"));
+        let credential = session_credential(&headers).unwrap();
+        assert!(matches!(credential, SessionCredential::Grant { .. }));
+        assert_eq!(credential.session_key(), "grant-123");
+        assert_eq!(credential.token(), token);
+    }
+
+    #[test]
+    fn parses_a_job_engagement_credential() {
+        let token = "b".repeat(20);
+        let headers = headers_with_bearer(&format!("job:engagement-456.{token}"));
+        let credential = session_credential(&headers).unwrap();
+        assert!(matches!(
+            credential,
+            SessionCredential::JobEngagement { .. }
+        ));
+        assert_eq!(credential.session_key(), "engagement-456");
+        assert_eq!(credential.token(), token);
+    }
+
+    #[test]
+    fn rejects_a_token_that_is_too_short() {
+        let headers = headers_with_bearer("grant-123.short");
+        assert!(session_credential(&headers).is_none());
+    }
+
+    #[test]
+    fn rejects_a_missing_authorization_header() {
+        assert!(session_credential(&HeaderMap::new()).is_none());
+    }
+
     #[test]
     fn disconnects_only_the_matching_consumer_session() {
         let meter = UsageMeter::default();
@@ -2409,6 +2683,33 @@ mod tests {
         assert!(next_session.consumer_connected);
         assert_eq!(next_session.requests, 0);
         assert_eq!(next_session.total_tokens, 0);
+    }
+
+    #[test]
+    fn tunnel_idle_tracking_respects_reconnect_and_activity() {
+        let tracker = SessionTracker::default();
+        // A freshly created tracker has no activity and no reconnect on
+        // record — it's immediately eligible to be considered idle with a
+        // zero grace period.
+        assert!(tracker.idle_for_at_least(0));
+
+        tracker.note_reconnect();
+        // Just reconnected: not idle even with a generous grace period,
+        // since the reconnect itself resets the clock.
+        assert!(!tracker.idle_for_at_least(60));
+
+        tracker.touch("job:abc");
+        // An active session also keeps it from being considered idle.
+        assert!(!tracker.idle_for_at_least(60));
+
+        tracker.forget("job:abc");
+        // Forgetting the only tracked session doesn't immediately make it
+        // idle — the reconnect from a moment ago still covers the grace
+        // period...
+        assert!(!tracker.idle_for_at_least(60));
+        // ...but it's eligible the instant the grace period requested is
+        // effectively zero.
+        assert!(tracker.idle_for_at_least(0));
     }
 
     #[test]
